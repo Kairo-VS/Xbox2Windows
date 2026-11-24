@@ -25,7 +25,8 @@ def make_block(x, y):
     for index, weight in enumerate(weights):
         bits |= index << shift
         shift += 3 if index == 0 else 4
-        colors.extend(((64 - weight) * a + weight * b + 32) >> 6 for a, b in zip(start, end))
+        inv_weight = 64 - weight
+        colors.extend((inv_weight * a + weight * b + 32) >> 6 for a, b in zip(start, end))
     return bits.to_bytes(16, "little"), colors
 
 
@@ -37,20 +38,24 @@ def fixture(columns=20, rows=18):
     tiled = bytearray(tile_count * 4096)
     linear = bytearray(columns * rows * 16)
     expected = bytearray(width * height * 4)
+    
     for tile in range(tile_count):
+        tile_x_base = (tile % tile_pitch) * 16
+        tile_y_base = (tile // tile_pitch) * 16
         for index in range(256):
-            x = (tile % tile_pitch) * 16 + ((index >> 2) & 3) + ((index >> 3) & 4) + ((index >> 4) & 8)
-            y = (tile // tile_pitch) * 16 + (index & 3) + ((index >> 2) & 4) + ((index >> 3) & 8)
+            x = tile_x_base + ((index >> 2) & 3) + ((index >> 3) & 4) + ((index >> 4) & 8)
+            y = tile_y_base + (index & 3) + ((index >> 2) & 4) + ((index >> 3) & 8)
             if x >= columns or y >= rows:
                 continue
             block, colors = make_block(x, y)
             src = tile * 4096 + index * 16
-            tiled[src:src+16] = block
+            tiled[src:src + 16] = block
             dst = (y * columns + x) * 16
-            linear[dst:dst+16] = block
+            linear[dst:dst + 16] = block
             for row in range(4):
                 pos = ((y * 4 + row) * width + x * 4) * 4
-                expected[pos:pos+16] = colors[row*16:(row+1)*16]
+                expected[pos:pos + 16] = colors[row * 16:(row + 1) * 16]
+                
     converted = linearize_4k_s(tiled, width, height)
     assert converted == linear
     return struct.pack("<4sII", b"BC7C", width, height), converted, expected
@@ -86,14 +91,9 @@ def write_patterned_mip(work: Path, width: int, height: int) -> Path:
 
 
 def check_band_limits(work: Path, compiler: str, renderer: str, backend: str, copy_source: str) -> None:
-    # Replace chosen pixels of a magnified two-texel mip with a texel fetched
-    # at its center, so every adapter returns the same readback. A center is
-    # within 1/512 texel below the boundary from pixel 2044 of 4096 (2048x)
-    # and exactly on that limit at pixel 255 of 512 (256x).
     first, second = "first", "second"
     mixed = "float4(first.r, second.g, first.b, second.a)"
     controls = (
-        # name, vertical, replaced pixels, returned color, expected first mismatch
         ("inside", False, "(size.x == 4096 && pixel.x == 2044) || (size.x == 512 && pixel.x == 255)", second, None),
         ("outside", False, "size.x == 4096 && pixel.x == 2043", second, "pixel_mismatch x=2043 y=0"),
         ("outside-tie", False, "size.x == 512 && pixel.x == 254", second, "pixel_mismatch x=254 y=0"),
@@ -128,8 +128,9 @@ float4 main(float2 uv : TEXCOORD0, float4 position : SV_Position) : SV_Target0 {
                 raise AssertionError(f"Band control {name}: the next texel must be accepted:\n{result.stderr}")
         elif result.returncode != 1 or mismatch not in result.stderr.splitlines():
             raise AssertionError(f"Band control {name}: expected {mismatch}:\n{result.stderr}")
+
+
 def solid_mip(size: int, stored: bytes, expected: bytes) -> bytes:
-    # Mode 6, identical endpoints and zero p bits give the same color at all indices.
     assert size in (4, 8) and len(stored) == len(expected) == 4 and all(value % 2 == 0 for value in stored)
     bits = 1 << 6
     for channel, value in enumerate(stored):
@@ -148,7 +149,6 @@ def check_lod_zero(work: Path, compiler: str, renderer: str, backend: str, impli
     lower = work / "lod-zero-lower.case"
     red, green = bytes((254, 0, 0, 254)), bytes((0, 254, 0, 254))
     base.write_bytes(solid_mip(8, red, red))
-    # A 4x4 viewport selects mip 1 implicitly for this 8x8 texture.
     lower.write_bytes(solid_mip(4, green, green))
     draw = [renderer, backend, "--check-bc7-mip1"]
     subprocess.run([*draw, implicit, base, lower], check=True)
@@ -164,8 +164,10 @@ def main():
     with tempfile.TemporaryDirectory() as directory:
         work = Path(directory)
         shader, source = work / "copy.cso", work / "copy.hlsl"
-        source.write_text(translate(assembly(False)), encoding="ascii")
+        source_code = translate(assembly(False))
+        source.write_text(source_code, encoding="ascii")
         subprocess.run([compiler, "-T", "ps_6_0", "-E", "main", "-Fo", shader, source], check=True)
+        
         header, rows, expected = fixture()
         case, output = work / "input.case", work / "actual.rgba"
         case.write_bytes(header + rows + expected)
@@ -174,20 +176,25 @@ def main():
         if result.returncode:
             return result.returncode
         assert output.read_bytes() == expected
+        
         check_lod_zero(work, compiler, renderer, backend, shader)
         check_all_modes(work, renderer, backend, shader)
+        
         vector = work / "bcpack-mode6.case"
         vector.write_bytes(struct.pack("<4sII", b"BC7C", 4, 4) + mode6.BLOCK + mode6.RGBA)
         subprocess.run([renderer, backend, "--check-bc7", shader, vector], check=True)
+        
         lower = work / "mip1.case"
         header, rows, expected = fixture(10, 9)
         lower.write_bytes(header + rows + expected)
         mip_draw = [renderer, backend, "--check-bc7-mip1", shader, case, lower]
         subprocess.run(mip_draw, check=True)
+        
         lower.write_bytes(header + rows[16:] + rows[:16] + expected)
         wrong = subprocess.run(mip_draw, capture_output=True, text=True)
         if wrong.returncode != 1 or "pixel_mismatch" not in wrong.stderr:
             raise AssertionError("Moving BC7 blocks must change the readback")
+            
         tail = []
         for level, blocks in enumerate((16, 8, 4, 2, 1), start=3):
             mip = work / f"resident{level}.case"
@@ -196,37 +203,39 @@ def main():
         tail.extend([write_patterned_mip(work, 2, 2), write_patterned_mip(work, 1, 1)])
         chain = [renderer, backend, "--check-bc7-tail", shader, "3", *tail]
         subprocess.run(chain, check=True)
+        
         header, rows, expected = fixture(4, 4)
         tail[2].write_bytes(header + rows[16:] + rows[:16] + expected)
         wrong = subprocess.run(chain, capture_output=True, text=True)
         if wrong.returncode != 1 or "pixel_mismatch" not in wrong.stderr:
             raise AssertionError("An incorrect middle mip must fail verification")
-        # A 4096x4 strip uses all thirteen mip levels while staying small.
+            
         narrow = [write_patterned_mip(work, 4096 >> level, max(1, 4 >> level)) for level in range(13)]
         subprocess.run([renderer, backend, "--check-bc7-mip1", shader, *narrow[:2]], check=True)
         narrow_chain = [renderer, backend, "--check-bc7-tail", shader, "0", *narrow]
         subprocess.run(narrow_chain, check=True)
+        
         repeated = subprocess.run([*narrow_chain, narrow[-1]], capture_output=True, text=True)
         if repeated.returncode != 1 or "Expected consecutive BC7 mip sizes" not in repeated.stderr:
             raise AssertionError("A BC7 mip chain must end at 1x1")
+            
         base = subprocess.run([renderer, backend, "--check-bc7", shader, narrow[-2]],
                               capture_output=True, text=True)
         if base.returncode != 1 or "Expected block-aligned BC7 base dimensions" not in base.stderr:
             raise AssertionError("A 2x1 BC7 level is valid only as a subresource")
+            
         stale = bytearray(narrow[-1].read_bytes())
-        stale[-4] ^= 0xff  # Change only the expected red channel of the 1x1 mip.
+        stale[-4] ^= 0xff
         narrow[-1].write_bytes(stale)
         wrong = subprocess.run(narrow_chain, capture_output=True, text=True)
         if wrong.returncode != 1 or "pixel_mismatch x=0 y=0" not in wrong.stderr.splitlines():
             raise AssertionError("The final 1x1 draw must check its visible texel")
-        # At mip 4, the 28-texel axis has one visible texel but a 1.75-texel
-        # unrounded span. Exercise both axes and a view starting at mip 2.
+            
         for width, height, first in ((28, 128, 2), (128, 28, 0)):
             levels = [write_patterned_mip(work, max(1, width >> level), max(1, height >> level))
                       for level in range(first, 8)]
             subprocess.run([renderer, backend, "--check-bc7-tail", shader, str(first), *levels], check=True)
-        # At mip 5 of 92x4 the resident width is 2; its successor must use
-        # the 1x1 mip even though 92 / 64 is still 1.4375.
+            
         for width, height, first in ((4096, 4, 11), (4, 4096, 11), (4096, 4, 12),
                                      (92, 4, 5), (4, 92, 5)):
             levels = [write_patterned_mip(work, max(1, width >> level), max(1, height >> level))
@@ -242,14 +251,11 @@ def main():
                 expected_draw = f"requested_mip={mip} sampled_mip={max(first, mip)} pixels={pixels} "
                 if expected_draw not in result.stdout:
                     raise AssertionError(f"Missing verified draw for {width}x{height}: {expected_draw}")
-        # Drawing the 2x1 mip of 4096x4 at 4096x4 puts pixels 2044-2047 within
-        # 1/512 texel of the texel boundary, where 8-bit fixed-point addressing
-        # may select the second texel. A 1/64-texel shift moves the first changed
-        # pixel to 2016 (2012 with 8-bit snapping), which must still be rejected.
+                    
         strip = [write_patterned_mip(work, 4096 >> level, 1) for level in (11, 12)]
         strip_args = ["11", "--base-size", "4096", "4", *strip]
         shifted_source, shifted = work / "shifted.hlsl", work / "shifted.cso"
-        shifted_source.write_text("#define main copy_pixel\n" + source.read_text(encoding="ascii") + """
+        shifted_source.write_text("#define main copy_pixel\n" + source_code + """
 #undef main
 float4 main(float2 uv : TEXCOORD0) : SV_Target0 {
     return copy_pixel(uv + float2(1.0 / 128, 0));
@@ -261,14 +267,14 @@ float4 main(float2 uv : TEXCOORD0) : SV_Target0 {
         allowed = [f"pixel_mismatch x={x} y=0" for x in range(2012, 2017)]
         if wrong.returncode != 1 or not any(line in allowed for line in wrong.stderr.splitlines()):
             raise AssertionError(f"A texel shift beyond the snapping band must fail near x=2016:\n{wrong.stderr}")
-        check_band_limits(work, compiler, renderer, backend, source.read_text(encoding="ascii"))
-        # The 29x19 fallback has an exact point-sample tie at (14, 0).
-        # Combine channels from the two texels on either side only at that pixel.
+            
+        check_band_limits(work, compiler, renderer, backend, source_code)
+        
         boundary_levels = [write_patterned_mip(work, max(1, 116 >> level), max(1, 76 >> level))
                            for level in range(3, 7)]
         boundary_args = ["3", "--base-size", "116", "76", *boundary_levels]
         subprocess.run([renderer, backend, "--check-bc7-tail", shader, *boundary_args], check=True)
-        source.write_text("#define main copy_pixel\n" + source.read_text(encoding="ascii") + """
+        source.write_text("#define main copy_pixel\n" + source_code + """
 #undef main
 float4 main(float2 uv : TEXCOORD0) : SV_Target0 {
     float4 original = copy_pixel(uv);
@@ -285,14 +291,14 @@ float4 main(float2 uv : TEXCOORD0) : SV_Target0 {
                                capture_output=True, text=True)
         if wrong.returncode != 1 or "pixel_mismatch x=14 y=0" not in wrong.stderr.splitlines():
             raise AssertionError("An exact boundary must still match one whole reference texel")
-        # The same 1x1 data is also legal at mip 12 of a tall strip, but 4x4
-        # has only three mip levels and cannot have mip 12 at all.
+            
         tiny = write_patterned_mip(work, 1, 1)
         start = [renderer, backend, "--check-bc7-tail", shader, "12", "--base-size"]
         subprocess.run([*start, "4", "4096", tiny], check=True)
         invalid = subprocess.run([*start, "4", "4", tiny], capture_output=True, text=True)
         if invalid.returncode != 1 or "incompatible with the first resident mip" not in invalid.stderr:
             raise AssertionError("A declared texture must actually contain the supplied level")
+            
         transposed = write_patterned_mip(work, 1, 2)
         wrong = subprocess.run([renderer, backend, "--check-bc7-tail", shader, "11",
                                 "--base-size", "4096", "4", transposed], capture_output=True, text=True)
